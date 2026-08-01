@@ -28,7 +28,7 @@ jobs:
           repository: rust-lang/rust
           ref: ${{ github.event.inputs.base_sha || '09ee43b2d6055539771bee8ac30a6e56eb4db773' }}
           path: rust
-          fetch-depth: 1
+          fetch-depth: 2
 
       - name: Deps
         run: |

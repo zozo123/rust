@@ -33,7 +33,7 @@ jobs:
           repository: rust-lang/rust
           ref: ${{ matrix.sha }}
           path: rust
-          fetch-depth: 1
+          fetch-depth: 2
       - name: Build stage1
         run: |
           sudo apt-get update

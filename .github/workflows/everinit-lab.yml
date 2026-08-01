@@ -67,7 +67,7 @@ jobs:
           repository: rust-lang/rust
           ref: ${{ steps.sha.outputs.sha }}
           path: rust
-          fetch-depth: 1
+          fetch-depth: 2
 
       - name: Deps
         run: |
