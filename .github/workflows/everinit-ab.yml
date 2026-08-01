@@ -1,18 +1,8 @@
 # A/B: EverInitializedPlaces InitIndex vs Local (#160033)
-# Builds stage1 rustc for base + candidate, times async/loop MCVEs.
 name: EverInit A/B (base vs #160033)
 
 on:
   workflow_dispatch:
-    inputs:
-      base_sha:
-        description: "Base rustc SHA (pre-#160033)"
-        required: true
-        default: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
-      candidate_sha:
-        description: "Candidate SHA (#160033 tip)"
-        required: true
-        default: "e7339de13da94243e4e0f0ee173be9be44164ab2"
   push:
     branches:
       - validation/everinit-ci
@@ -23,8 +13,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  # Reduce noise / disk
   RUST_BACKTRACE: 0
+  BASE_SHA: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
 
 jobs:
   build-rustc:
@@ -34,102 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: base
-            sha_input: base_sha
-            default_sha: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
-          - variant: candidate
-            sha_input: candidate_sha
-            default_sha: "e7339de13da94243e4e0f0ee173be9be44164ab2"
+        variant: [base, candidate]
     steps:
-      - name: Free disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h
-
-      - name: Resolve SHA
-        id: sha
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ matrix.variant }}" = "base" ]; then
-              echo "sha=${{ github.event.inputs.base_sha }}" >> "$GITHUB_OUTPUT"
-            else
-              echo "sha=${{ github.event.inputs.candidate_sha }}" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "sha=${{ matrix.default_sha }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout rustc sources
-        uses: actions/checkout@v4
-        with:
-          repository: rust-lang/rust
-          ref: ${{ steps.sha.outputs.sha }}
-          path: rust
-          fetch-depth: 2
-          submodules: false
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config libssl-dev \
-            python3 git curl ccache
-          # Host rustc for bootstrap
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Configure bootstrap
-        working-directory: rust
-        run: |
-          cat > bootstrap.toml <<'TOML'
-          change-id = 99999999
-          profile = "compiler"
-
-          [llvm]
-          download-ci-llvm = true
-
-          [build]
-          docs = false
-          extended = false
-          tools = []
-          configure-args = []
-
-          [rust]
-          channel = "dev"
-          download-rustc = false
-          debug = false
-          debuginfo-level = 0
-          debuginfo-level-rustc = 0
-          debuginfo-level-std = 0
-          incremental = false
-          dist-src = false
-          lld = false
-          llvm-tools = false
-
-          [dist]
-          src-tarball = false
-          TOML
-          # Prefer x.py with system python
-          python3 -V
-          rustc -V
-          cargo -V
-
-      - name: Build stage1 rustc + std
-        working-directory: rust
-        run: |
-          # Stage1 compiler + library is enough to compile MCVEs
-          python3 x.py build --stage 1 library -j"$(nproc)"
-          ls -la build/host/stage1/bin/
-          build/host/stage1/bin/rustc -vV
-
-      - name: Pack stage1 toolchain
-        run: |
-          tar -C rust/build/host -czf "stage1-${{ matrix.variant }}.tar.gz" stage1
-          ls -lh "stage1-${{ matrix.variant }}.tar.gz"
-
-      - name: Upload stage1
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
+      - name: Build stage1
+        run: bash .github/scripts/build-stage1.sh ${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
         with:
           name: stage1-${{ matrix.variant }}
           path: stage1-${{ matrix.variant }}.tar.gz
@@ -141,18 +41,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Download base
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: stage1-base
           path: arts
-
-      - name: Download candidate
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: stage1-candidate
           path: arts
-
       - name: Unpack toolchains
         run: |
           mkdir -p base cand
@@ -162,14 +58,11 @@ jobs:
           cand/stage1/bin/rustc -vV
           echo "BASE_RUSTC=$PWD/base/stage1/bin/rustc" >> "$GITHUB_ENV"
           echo "CAND_RUSTC=$PWD/cand/stage1/bin/rustc" >> "$GITHUB_ENV"
-
-      - name: Checkout MCVE suite
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ashi009/rustc-async-borrowck-repros
           path: repros
           fetch-depth: 1
-
       - name: Generate extra hypothesis sources
         working-directory: repros
         run: |
@@ -177,58 +70,23 @@ jobs:
           from pathlib import Path
 
           def write_same_local_loops(path: Path, n: int) -> None:
-              # Same local, many loop-init sites (favorable to Local lattice)
-              lines = [
-                  "#![allow(unused)]",
-                  "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
-                  "pub fn probe(mut acc: u64) -> u64 {",
-              ]
-              for i in range(n):
-                  lines += [
-                      "    loop {",
-                      "        acc = step(acc);",
-                      "        break;",
-                      "    }",
-                  ]
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe(mut acc: u64) -> u64 {"]
+              for _ in range(n):
+                  lines += ["    loop {", "        acc = step(acc);", "        break;", "    }"]
               lines += ["    acc", "}"]
               path.write_text("\n".join(lines) + "\n")
 
           def write_unique_locals(path: Path, n: int) -> None:
-              # Many locals, one init each (stresses domain width)
-              lines = [
-                  "#![allow(unused)]",
-                  "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
-                  "pub fn probe() -> u64 {",
-              ]
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe() -> u64 {"]
               for i in range(n):
-                  lines += [
-                      f"    let mut x{i}: u64;",
-                      f"    loop {{",
-                      f"        x{i} = step({i} as u64);",
-                      f"        break;",
-                      f"    }}",
-                  ]
-              # use them so they stay live
-              uses = " + ".join(f"x{i}" for i in range(n))
-              lines += [f"    {uses}", "}"]
+                  lines += [f"    let mut x{i}: u64;", "    loop {", f"        x{i} = step({i} as u64);", "        break;", "    }"]
+              lines += ["    " + " + ".join(f"x{i}" for i in range(n)), "}"]
               path.write_text("\n".join(lines) + "\n")
 
           def write_storage_dead_reuse(path: Path, n: int) -> None:
-              # Same name recycled via nested scopes / sequential lets
-              lines = [
-                  "#![allow(unused)]",
-                  "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
-                  "pub fn probe() -> u64 {",
-                  "    let mut acc = 0u64;",
-              ]
-              for i in range(n):
-                  lines += [
-                      "    {",
-                      "        let mut y: u64;",
-                      "        loop { y = step(acc); break; }",
-                      "        acc = y;",
-                      "    }",
-                  ]
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe() -> u64 {", "    let mut acc = 0u64;"]
+              for _ in range(n):
+                  lines += ["    {", "        let mut y: u64;", "        loop { y = step(acc); break; }", "        acc = y;", "    }"]
               lines += ["    acc", "}"]
               path.write_text("\n".join(lines) + "\n")
 
@@ -236,22 +94,15 @@ jobs:
               write_same_local_loops(Path(f"same_local_loops_{n}.rs"), n)
               write_unique_locals(Path(f"unique_locals_{n}.rs"), n)
               write_storage_dead_reuse(Path(f"storage_dead_reuse_{n}.rs"), n)
-          print("generated hypothesis sources")
+          print("generated")
           PY
-          ls -la *.rs | head -40
-
       - name: Time all MCVEs (base vs candidate)
         run: |
           python3 <<'PY'
           import json, os, subprocess, statistics, time
           from pathlib import Path
-
-          base = os.environ["BASE_RUSTC"]
-          cand = os.environ["CAND_RUSTC"]
+          base, cand = os.environ["BASE_RUSTC"], os.environ["CAND_RUSTC"]
           repros = Path("repros")
-
-          sources = sorted(repros.glob("*.rs"))
-          # Prefer interesting names first
           prefer = [
               "awaits_400", "awaits_800", "awaits_1600",
               "hold_500", "hold_1000", "hold_2000",
@@ -261,15 +112,11 @@ jobs:
               "storage_dead_reuse_200", "storage_dead_reuse_400", "storage_dead_reuse_800",
               "drop_500", "drop_1000", "drop_2000",
           ]
-          by_stem = {p.stem: p for p in sources}
-          ordered = [by_stem[s] for s in prefer if s in by_stem]
-          ordered += [p for p in sources if p.stem not in prefer]
+          by = {p.stem: p for p in repros.glob("*.rs")}
+          ordered = [by[s] for s in prefer if s in by] + [p for p in sorted(repros.glob("*.rs")) if p.stem not in prefer]
 
-          def time_compile(rustc: str, src: Path, out: Path, warmup=1, runs=3):
-              cmd = [
-                  rustc, "--edition", "2021", "--crate-type=lib",
-                  "--emit=metadata", str(src), "-o", str(out),
-              ]
+          def time_compile(rustc, src, out, warmup=1, runs=3):
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib", "--emit=metadata", str(src), "-o", str(out)]
               for _ in range(warmup):
                   subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               samples = []
@@ -288,46 +135,30 @@ jobs:
                   b = time_compile(base, src, Path("out/base.rmeta"))
                   c = time_compile(cand, src, Path("out/cand.rmeta"))
               except subprocess.CalledProcessError as e:
-                  print(f"FAIL compile {src.name}: {e}", flush=True)
                   results.append({"src": src.name, "error": str(e)})
                   continue
               b_med, c_med = statistics.median(b), statistics.median(c)
               ratio = c_med / b_med if b_med > 0 else None
               row = {
                   "src": src.name,
-                  "base_median_s": round(b_med, 4),
-                  "cand_median_s": round(c_med, 4),
+                  "base_median_s": round(b_med, 4), "cand_median_s": round(c_med, 4),
                   "ratio": round(ratio, 4) if ratio else None,
-                  "base_samples": [round(x, 4) for x in b],
-                  "cand_samples": [round(x, 4) for x in c],
+                  "base_samples": [round(x, 4) for x in b], "cand_samples": [round(x, 4) for x in c],
                   "saving_s": round(b_med - c_med, 4),
               }
               results.append(row)
               print(json.dumps(row), flush=True)
 
-          # Evidence gate for the primary hypothesis (same-local / awaits)
           primary = [r for r in results if r.get("src", "").startswith(("awaits_", "loops_", "same_local_"))]
           strong = []
           for r in primary:
-              if "ratio" not in r or r["ratio"] is None:
+              if r.get("ratio") is None:
                   continue
-              # require clear win on large cases
               if r["src"] in ("awaits_800", "awaits_1600", "loops_800", "loops_1600", "same_local_loops_800"):
-                  strong.append(r["ratio"] < 0.5)  # at least 2x faster
-
-          summary = {
-              "results": results,
-              "primary_large_2x_wins": strong,
-              "gate_large_cases_2x": all(strong) if strong else False,
-          }
+                  strong.append(r["ratio"] < 0.5)
+          summary = {"results": results, "primary_large_2x_wins": strong, "gate_large_cases_2x": all(strong) if strong else False}
           Path("everinit-results.json").write_text(json.dumps(summary, indent=2))
-          print("==== SUMMARY ====", flush=True)
-          print(json.dumps(summary, indent=2), flush=True)
-
           md = ["### EverInit A/B results", "",
-                f"- base: `{os.environ.get('BASE_SHA','?')}`",
-                f"- candidate: `{os.environ.get('CAND_SHA','?')}`",
-                "",
                 "| source | base median (s) | cand median (s) | ratio | saving (s) |",
                 "| --- | ---: | ---: | ---: | ---: |"]
           for r in results:
@@ -339,12 +170,9 @@ jobs:
           md.append(f"Large-case ≥2× gate: **{'PASS' if summary['gate_large_cases_2x'] else 'CHECK'}**")
           text = "\n".join(md)
           print(text)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(text + "\n")
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
           PY
-
-      - name: Upload results JSON
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: everinit-results
           path: everinit-results.json

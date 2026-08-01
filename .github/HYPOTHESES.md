@@ -6,12 +6,16 @@ Disposable workflows on branch `validation/everinit-ci` for
 
 **Not for merge into rust-lang/rust.** Evidence collection only.
 
-## SHAs
+## SHAs / build method
 
-| Role | SHA |
+| Role | How |
 | --- | --- |
-| Base (pre-#160033) | `09ee43b2d6055539771bee8ac30a6e56eb4db773` |
-| Candidate (#160033 tip) | `e7339de13da94243e4e0f0ee173be9be44164ab2` |
+| Base | Checkout `09ee43b2d6055539771bee8ac30a6e56eb4db773` (has **download-ci-llvm** artifacts) |
+| Candidate | Same checkout + apply [PR #160033.patch](https://github.com/rust-lang/rust/pull/160033.patch) as **dirty tree** (HEAD stays at base so CI LLVM still downloads) |
+
+Do **not** checkout the PR tip commits directly: they 404 on `ci-artifacts.rust-lang.org` (no prebuilt LLVM).
+
+Shared builder: `.github/scripts/build-stage1.sh {base|candidate}`
 
 ## Workflows (fan-out)
 
