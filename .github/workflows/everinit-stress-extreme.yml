@@ -1,0 +1,274 @@
+# Extreme stress: many parallel runners, large N, multi-seed noise, zed-like patterns.
+# Evolves the hypothesis space from first-wave GHA results (awaits win; unique flat).
+name: EverInit stress extreme
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - validation/everinit-ci
+      - validation/everinit-stress-**
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
+
+jobs:
+  build:
+    name: "stage1 ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, candidate]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/build-stage1.sh ${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ matrix.variant }}
+          path: stage1-${{ matrix.variant }}.tar.gz
+          retention-days: 3
+
+  # Extreme await cliff (primary win region)
+  extreme-await:
+    name: "await n=${{ matrix.n }} seed=${{ matrix.seed }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [800, 1200, 1600, 2000, 2400, 2800, 3200, 4000]
+        seed: [0, 1, 2]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - name: Time extreme awaits
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+          n, seed = int("${{ matrix.n }}"), int("${{ matrix.seed }}")
+          # seed only perturbs idle arithmetic so MIR shape stays await-heavy
+          lines = ["#![allow(unused)]",
+                   "async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                   f"const SEED: u64 = {seed};",
+                   "pub async fn probe(t: &u64, mut acc: u64) -> u64 {"]
+          for i in range(n):
+              lines.append(f"    acc = step(acc.wrapping_add(*t).wrapping_add(SEED ^{i})).await;")
+          Path("case.rs").write_text("\n".join(lines + ["    acc", "}"]) + "\n")
+
+          def t(rustc, runs=2):
+              out = Path("o.rmeta")
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", "case.rs", "-o", str(out)]
+              subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              s = []
+              for _ in range(runs):
+                  out.unlink(missing_ok=True)
+                  t0 = time.perf_counter()
+                  subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  s.append(time.perf_counter() - t0)
+              return s
+
+          try:
+              b, c = t("base/stage1/bin/rustc"), t("cand/stage1/bin/rustc")
+          except Exception as e:
+              Path("result.json").write_text(json.dumps({"family":"awaits","n":n,"seed":seed,"error":str(e)[:1500]}))
+              raise
+          bm, cm = statistics.median(b), statistics.median(c)
+          row = {"family":"awaits","n":n,"seed":seed,
+                 "base_median_s":round(bm,4),"cand_median_s":round(cm,4),
+                 "ratio":round(cm/bm,4) if bm else None,"saving_s":round(bm-cm,4)}
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps(row))
+          open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(
+              f"### awaits n={n} seed={seed}\nbase {bm:.3f}s cand {cm:.3f}s ratio {cm/bm:.3f}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extreme-await-${{ matrix.n }}-${{ matrix.seed }}
+          path: result.json
+
+  # Public repro suite with 5-run noise (stress variance)
+  repro-noise:
+    name: "repro ${{ matrix.src }} r=${{ matrix.rep }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [awaits_400, awaits_800, awaits_1600, loops_400, loops_800, loops_1600]
+        rep: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - uses: actions/checkout@v4
+        with:
+          repository: ashi009/rustc-async-borrowck-repros
+          path: repros
+          fetch-depth: 1
+      - name: Time with 5 samples
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+          stem, rep = "${{ matrix.src }}", int("${{ matrix.rep }}")
+          src = Path("repros")/f"{stem}.rs"
+          def t(rustc):
+              out=Path("o.rmeta")
+              cmd=[rustc,"--edition","2021","--crate-type=lib","--emit=metadata",str(src),"-o",str(out)]
+              subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              s=[]
+              for _ in range(5):
+                  out.unlink(missing_ok=True)
+                  t0=time.perf_counter()
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                  s.append(time.perf_counter()-t0)
+              return s
+          b,c=t("base/stage1/bin/rustc"),t("cand/stage1/bin/rustc")
+          bm,cm=statistics.median(b),statistics.median(c)
+          row={"src":stem,"rep":rep,"base_median_s":round(bm,4),"cand_median_s":round(cm,4),
+               "ratio":round(cm/bm,4) if bm else None,"base_samples":[round(x,4) for x in b],
+               "cand_samples":[round(x,4) for x in c]}
+          Path("result.json").write_text(json.dumps(row,indent=2))
+          print(json.dumps(row))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noise-${{ matrix.src }}-${{ matrix.rep }}
+          path: result.json
+
+  # Mixed-init stress: many locals × multi-await on one hot local (hybrid)
+  hybrid:
+    name: "hybrid locals=${{ matrix.locals }} awaits=${{ matrix.awaits }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        locals: [10, 50, 100, 200]
+        awaits: [100, 400, 800, 1600]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - name: Hybrid generator
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+          L, A = int("${{ matrix.locals }}"), int("${{ matrix.awaits }}")
+          lines = ["#![allow(unused)]",
+                   "async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                   "pub async fn probe(t: &u64) -> u64 {"]
+          for i in range(L):
+              lines.append(f"    let mut x{i} = {i}u64;")
+          lines.append("    let mut acc = 0u64;")
+          for _ in range(A):
+              lines.append("    acc = step(acc.wrapping_add(*t)).await;")
+          uses = " + ".join([f"x{i}" for i in range(L)] + ["acc"])
+          lines += [f"    {uses}", "}"]
+          Path("case.rs").write_text("\n".join(lines)+"\n")
+          def t(rustc):
+              out=Path("o.rmeta")
+              cmd=[rustc,"--edition","2021","--crate-type=lib","--emit=metadata","case.rs","-o",str(out)]
+              subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              s=[]
+              for _ in range(3):
+                  out.unlink(missing_ok=True)
+                  t0=time.perf_counter()
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                  s.append(time.perf_counter()-t0)
+              return s
+          b,c=t("base/stage1/bin/rustc"),t("cand/stage1/bin/rustc")
+          bm,cm=statistics.median(b),statistics.median(c)
+          row={"family":"hybrid","locals":L,"awaits":A,"base_median_s":round(bm,4),
+               "cand_median_s":round(cm,4),"ratio":round(cm/bm,4) if bm else None}
+          Path("result.json").write_text(json.dumps(row,indent=2))
+          print(json.dumps(row))
+          open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(
+              f"### hybrid L={L} A={A}\nbase {bm:.3f} cand {cm:.3f} ratio {cm/bm:.3f}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-${{ matrix.locals }}-${{ matrix.awaits }}
+          path: result.json
+
+  report:
+    needs: [extreme-await, repro-noise, hybrid]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+      - name: Aggregate stress
+        run: |
+          python3 <<'PY'
+          import json, os
+          from pathlib import Path
+          from collections import defaultdict
+          rows=[]
+          for p in Path("all").rglob("result.json"):
+              try: rows.append(json.loads(p.read_text()))
+              except: pass
+          Path("stress-all.json").write_text(json.dumps(rows,indent=2))
+          md=["# Extreme stress aggregate", f"rows={len(rows)}", ""]
+          awaits=[r for r in rows if r.get("family")=="awaits" and "ratio" in r and "error" not in r]
+          by_n=defaultdict(list)
+          for r in awaits: by_n[r["n"]].append(r["ratio"])
+          md += ["## Awaits by n (median ratio across seeds)", "| n | median ratio | min | max | samples |", "| ---: | ---: | ---: | ---: | ---: |"]
+          for n in sorted(by_n):
+              xs=sorted(by_n[n]); mid=xs[len(xs)//2]
+              md.append(f"| {n} | {mid:.4f} | {xs[0]:.4f} | {xs[-1]:.4f} | {len(xs)} |")
+          repros=[r for r in rows if r.get("src") and "ratio" in r]
+          by=defaultdict(list)
+          for r in repros: by[r["src"]].append(r["ratio"])
+          md += ["", "## Public repro noise (ratio across reps)", "| src | median ratio | min | max |", "| --- | ---: | ---: | ---: |"]
+          for s in sorted(by):
+              xs=sorted(by[s]); md.append(f"| {s} | {xs[len(xs)//2]:.4f} | {xs[0]:.4f} | {xs[-1]:.4f} |")
+          hybrids=[r for r in rows if r.get("family")=="hybrid" and "ratio" in r]
+          md += ["", "## Hybrid locals×awaits", "| locals | awaits | ratio | base | cand |", "| ---: | ---: | ---: | ---: | ---: |"]
+          for r in sorted(hybrids, key=lambda x:(x["locals"],x["awaits"])):
+              md.append(f"| {r['locals']} | {r['awaits']} | {r['ratio']} | {r['base_median_s']} | {r['cand_median_s']} |")
+          text="\n".join(md)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(text)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stress-aggregate
+          path: stress-all.json
