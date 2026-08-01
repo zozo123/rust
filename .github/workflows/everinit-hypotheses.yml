@@ -2,10 +2,7 @@ name: EverInit hypotheses (candidate + A/B matrix)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - validation/everinit-ci
-      - validation/everinit-hyp-**
+  # push disabled: exploratory only; use everinit-valid-ab.yml for pinned A/B
 
 permissions:
   contents: read

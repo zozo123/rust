@@ -2,10 +2,7 @@ name: EverInit scale curve A/B
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - validation/everinit-ci
-      - validation/everinit-scale-**
+  # push disabled: exploratory only; use everinit-valid-ab.yml for pinned A/B
 
 permissions:
   contents: read

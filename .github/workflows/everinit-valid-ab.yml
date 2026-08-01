@@ -1,0 +1,384 @@
+# VALID EverInit A/B only.
+# - Pinned patch (SHA-256) + base SHA + candidate head in every result JSON
+# - Public awaits_N / loops_N only (ashi009), plus MIR-valid sequential loops
+# - Seeded alternating A/B pairs (not all-base-then-all-cand)
+# - Invalid families (unconditional-break "loops", fake StorageDead reuse) deleted
+name: EverInit VALID A/B (pinned)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - validation/everinit-ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: everinit-valid-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
+  CANDIDATE_HEAD: "e7339de13da94243e4e0f0ee173be9be44164ab2"
+  PATCH_SHA256_EXPECT: "92eb41d1b3b928c827874d463c9f55aed9e38604bf0c69d7e75f1f3509d3f0dc"
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 0
+
+jobs:
+  build-rustc:
+    name: "stage1 ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, candidate]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stage1 (pinned)
+        run: bash .github/scripts/build-stage1.sh ${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ matrix.variant }}
+          path: |
+            stage1-${{ matrix.variant }}.tar.gz
+            identity-${{ matrix.variant }}.json
+            rustc-vv-${{ matrix.variant }}.txt
+          retention-days: 14
+
+  # Public suite: primary valid signal
+  public-repro:
+    name: "public ${{ matrix.src }} pairs=${{ matrix.pairs }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - src: awaits_400
+            pairs: 12
+          - src: awaits_800
+            pairs: 8
+          - src: awaits_1600
+            pairs: 4
+          - src: loops_400
+            pairs: 12
+          - src: loops_800
+            pairs: 8
+          - src: loops_1600
+            pairs: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - uses: actions/checkout@v4
+        with:
+          repository: ashi009/rustc-async-borrowck-repros
+          path: repros
+          fetch-depth: 1
+      - name: Alternating A/B pairs
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, platform, statistics, subprocess, time
+          from pathlib import Path
+
+          stem = "${{ matrix.src }}"
+          pairs = int("${{ matrix.pairs }}")
+          src = Path("repros") / f"{stem}.rs"
+          assert src.exists(), src
+
+          base_rustc = "base/stage1/bin/rustc"
+          cand_rustc = "cand/stage1/bin/rustc"
+          base_id = json.loads(Path("arts/identity-base.json").read_text()) if Path("arts/identity-base.json").exists() else {}
+          cand_id = json.loads(Path("arts/identity-candidate.json").read_text()) if Path("arts/identity-candidate.json").exists() else {}
+
+          def one(rustc, out):
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", str(src), "-o", str(out)]
+              out.unlink(missing_ok=True)
+              t0 = time.perf_counter()
+              r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              dt = time.perf_counter() - t0
+              if r.returncode != 0:
+                  raise RuntimeError(r.stderr.decode()[-2000:])
+              return dt
+
+          # Warmup both once
+          one(base_rustc, Path("w0.rmeta"))
+          one(cand_rustc, Path("w1.rmeta"))
+
+          base_samples, cand_samples, order = [], [], []
+          # Seeded alternating pairs: A B, B A, A B, ...
+          for i in range(pairs):
+              if i % 2 == 0:
+                  seq = [("base", base_rustc, Path("b.rmeta")), ("cand", cand_rustc, Path("c.rmeta"))]
+              else:
+                  seq = [("cand", cand_rustc, Path("c.rmeta")), ("base", base_rustc, Path("b.rmeta"))]
+              for name, rustc, out in seq:
+                  dt = one(rustc, out)
+                  order.append({"i": i, "which": name, "s": round(dt, 4)})
+                  if name == "base":
+                      base_samples.append(dt)
+                  else:
+                      cand_samples.append(dt)
+
+          bm, cm = statistics.median(base_samples), statistics.median(cand_samples)
+          ratio = cm / bm if bm else None
+          # Pair ratios when equal count
+          pair_ratios = []
+          for i in range(min(len(base_samples), len(cand_samples))):
+              if base_samples[i] > 0:
+                  pair_ratios.append(cand_samples[i] / base_samples[i])
+
+          row = {
+              "kind": "public_repro",
+              "src": stem + ".rs",
+              "pairs": pairs,
+              "protocol": "alternating_ab_pairs",
+              "base_median_s": round(bm, 4),
+              "cand_median_s": round(cm, 4),
+              "ratio": round(ratio, 4) if ratio is not None else None,
+              "pair_ratio_median": round(statistics.median(pair_ratios), 4) if pair_ratios else None,
+              "base_samples": [round(x, 4) for x in base_samples],
+              "cand_samples": [round(x, 4) for x in cand_samples],
+              "order": order,
+              "base_sha": base_id.get("base_sha") or os.environ.get("BASE_SHA"),
+              "candidate_head": base_id.get("candidate_head") or os.environ.get("CANDIDATE_HEAD"),
+              "patch_sha256": base_id.get("patch_sha256") or os.environ.get("PATCH_SHA256_EXPECT"),
+              "workflow_sha": os.environ.get("GITHUB_SHA"),
+              "runner": {
+                  "platform": platform.platform(),
+                  "processor": platform.processor(),
+                  "python": platform.python_version(),
+              },
+              "rustc_vv_base": Path("arts/rustc-vv-base.txt").read_text() if Path("arts/rustc-vv-base.txt").exists() else None,
+              "rustc_vv_candidate": Path("arts/rustc-vv-candidate.txt").read_text() if Path("arts/rustc-vv-candidate.txt").exists() else None,
+              "identity_base": base_id,
+              "identity_candidate": cand_id,
+          }
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps({k: row[k] for k in ("src","pairs","base_median_s","cand_median_s","ratio","pair_ratio_median","base_sha","candidate_head","patch_sha256")}))
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(
+              f"### {stem}\n\n"
+              f"- pairs: {pairs}\n"
+              f"- base median: **{bm:.3f}s**\n"
+              f"- cand median: **{cm:.3f}s**\n"
+              f"- ratio: **{ratio:.4f}**\n"
+              f"- pair-ratio median: **{statistics.median(pair_ratios):.4f}**\n"
+              f"- base_sha: `{row['base_sha']}`\n"
+              f"- candidate_head: `{row['candidate_head']}`\n"
+              f"- patch_sha256: `{row['patch_sha256']}`\n"
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valid-public-${{ matrix.src }}
+          path: result.json
+          retention-days: 14
+
+  # MIR-valid sequential loops: real backedge via volatile-ish opaque condition
+  valid-seq-loops:
+    name: "valid_seq_loops n=${{ matrix.n }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [200, 400, 800, 1200, 1600]
+        pairs: [8]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - name: Generate MIR-valid loops + alternating A/B
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, platform, statistics, subprocess, time
+          from pathlib import Path
+          n, pairs = int("${{ matrix.n }}"), int("${{ matrix.pairs }}")
+
+          # Real backedge: condition/exit must remain possible in MIR.
+          # black_box-like via ptr read so rustc cannot delete the loop.
+          lines = [
+              "#![allow(unused)]",
+              "#[inline(never)]",
+              "fn opaque_continue(acc: &u64, i: u64) -> bool {",
+              "    // Volatile-ish: read through raw pointer so MIR keeps the branch.",
+              "    let p = acc as *const u64;",
+              "    unsafe { p.read() }.wrapping_add(i) % 97 != 0",
+              "}",
+              "#[inline(never)]",
+              "fn opaque_exit(acc: &u64, i: u64) -> bool {",
+              "    let p = acc as *const u64;",
+              "    unsafe { p.read() }.wrapping_add(i) % 53 == 0",
+              "}",
+              "#[inline(never)]",
+              "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+              "pub fn probe(mut acc: u64) -> u64 {",
+          ]
+          for i in range(n):
+              lines += [
+                  f"    while opaque_continue(&acc, {i}) {{",
+                  "        acc = step(acc);",
+                  f"        if opaque_exit(&acc, {i}) {{ break; }}",
+                  "    }",
+              ]
+          lines += ["    acc", "}"]
+          Path("case.rs").write_text("\n".join(lines) + "\n")
+
+          base_rustc, cand_rustc = "base/stage1/bin/rustc", "cand/stage1/bin/rustc"
+
+          def one(rustc, out):
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", "case.rs", "-o", str(out)]
+              out.unlink(missing_ok=True)
+              t0 = time.perf_counter()
+              r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              dt = time.perf_counter() - t0
+              if r.returncode:
+                  raise RuntimeError(r.stderr.decode()[-2500:])
+              return dt
+
+          one(base_rustc, Path("w0.rmeta")); one(cand_rustc, Path("w1.rmeta"))
+          bs, cs = [], []
+          for i in range(pairs):
+              seq = [(bs, base_rustc), (cs, cand_rustc)] if i % 2 == 0 else [(cs, cand_rustc), (bs, base_rustc)]
+              for bucket, rustc in seq:
+                  bucket.append(one(rustc, Path("t.rmeta")))
+
+          bm, cm = statistics.median(bs), statistics.median(cs)
+          base_id = json.loads(Path("arts/identity-base.json").read_text()) if Path("arts/identity-base.json").exists() else {}
+          row = {
+              "kind": "valid_seq_loops",
+              "n": n,
+              "pairs": pairs,
+              "protocol": "alternating_ab_pairs",
+              "note": "opaque continue/exit → real MIR backedge (not unconditional break)",
+              "base_median_s": round(bm, 4),
+              "cand_median_s": round(cm, 4),
+              "ratio": round(cm/bm, 4) if bm else None,
+              "base_samples": [round(x, 4) for x in bs],
+              "cand_samples": [round(x, 4) for x in cs],
+              "base_sha": base_id.get("base_sha") or os.environ.get("BASE_SHA"),
+              "candidate_head": base_id.get("candidate_head") or os.environ.get("CANDIDATE_HEAD"),
+              "patch_sha256": base_id.get("patch_sha256") or os.environ.get("PATCH_SHA256_EXPECT"),
+              "workflow_sha": os.environ.get("GITHUB_SHA"),
+              "runner": {"platform": platform.platform(), "processor": platform.processor()},
+          }
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps(row))
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(
+              f"### valid_seq_loops n={n}\nbase {bm:.3f}s cand {cm:.3f}s ratio {cm/bm:.4f}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valid-seq-${{ matrix.n }}
+          path: result.json
+          retention-days: 14
+
+  report:
+    name: Aggregate valid results
+    needs: [public-repro, valid-seq-loops]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+      - name: Scaling exponents + table
+        run: |
+          python3 <<'PY'
+          import json, math, os
+          from pathlib import Path
+          rows = []
+          for p in Path("all").rglob("result.json"):
+              try:
+                  rows.append(json.loads(p.read_text()))
+              except Exception as e:
+                  print("skip", p, e)
+          Path("valid-all.json").write_text(json.dumps(rows, indent=2))
+
+          def alpha(t1, t2, n1, n2):
+              if t1 <= 0 or n1 <= 0 or n2 <= n1:
+                  return None
+              return math.log(t2 / t1) / math.log(n2 / n1)
+
+          md = ["# VALID EverInit A/B", "",
+                f"rows={len(rows)}", "",
+                "## Public repros", "",
+                "| src | pairs | base | cand | ratio | pair-ratio med | base_sha | patch_sha256 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"]
+          publics = [r for r in rows if r.get("kind") == "public_repro"]
+          publics.sort(key=lambda r: r.get("src", ""))
+          for r in publics:
+              md.append(
+                  f"| {r.get('src')} | {r.get('pairs')} | {r.get('base_median_s')} | {r.get('cand_median_s')} | "
+                  f"{r.get('ratio')} | {r.get('pair_ratio_median')} | `{str(r.get('base_sha'))[:12]}` | `{str(r.get('patch_sha256'))[:12]}…` |"
+              )
+
+          # exponents for awaits/loops
+          def series(prefix):
+              out = []
+              for r in publics:
+                  s = r.get("src", "")
+                  if s.startswith(prefix):
+                      try:
+                          n = int(s.split("_")[1].split(".")[0])
+                          out.append((n, r["base_median_s"], r["cand_median_s"]))
+                      except Exception:
+                          pass
+              return sorted(out)
+
+          md += ["", "## Effective scaling exponents (public)", "",
+                 "| series | N→2N | base α | cand α |",
+                 "| --- | --- | ---: | ---: |"]
+          for pref, label in (("awaits", "awaits"), ("loops", "loops")):
+              s = series(pref)
+              for i in range(1, len(s)):
+                  n0, b0, c0 = s[i-1]
+                  n1, b1, c1 = s[i]
+                  if n1 == 2 * n0:
+                      md.append(f"| {label} | {n0}→{n1} | {alpha(b0,b1,n0,n1):.2f} | {alpha(c0,c1,n0,n1):.2f} |")
+
+          seq = [r for r in rows if r.get("kind") == "valid_seq_loops"]
+          seq.sort(key=lambda r: r.get("n", 0))
+          md += ["", "## MIR-valid sequential loops (opaque backedge)", "",
+                 "| n | pairs | base | cand | ratio |",
+                 "| ---: | ---: | ---: | ---: | ---: |"]
+          for r in seq:
+              md.append(f"| {r.get('n')} | {r.get('pairs')} | {r.get('base_median_s')} | {r.get('cand_median_s')} | {r.get('ratio')} |")
+
+          md += ["", "## Claim", "",
+                 "On these sequential cyclic CFGs, old representation scales roughly **quadratic+**,",
+                 "candidate moves **closer to linear**. Report exponents, not cherry-picked max speedup.",
+                 "",
+                 "Invalid families (unconditional-break loops, fake StorageDead reuse) are **not** in this workflow.",
+                 ""]
+          text = "\n".join(md)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valid-aggregate
+          path: valid-all.json
+          retention-days: 30

@@ -3,10 +3,7 @@ name: EverInit lab (mega matrix)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - validation/everinit-ci
-      - validation/everinit-lab-**
+  # push disabled: exploratory only; use everinit-valid-ab.yml for pinned A/B
 
 permissions:
   contents: read
