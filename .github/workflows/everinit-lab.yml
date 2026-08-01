@@ -1,0 +1,677 @@
+# Mega lab: build stage1 base + #160033 once, then fan out many parallel hypothesis jobs.
+# Target: evidence for InitIndex→Local (rust-lang/rust#160033) against await/loop cliffs.
+name: EverInit lab (mega matrix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "Base rustc SHA (pre-#160033)"
+        required: true
+        default: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
+      candidate_sha:
+        description: "Candidate SHA (#160033 tip)"
+        required: true
+        default: "e7339de13da94243e4e0f0ee173be9be44164ab2"
+  push:
+    branches:
+      - validation/everinit-ci
+      - validation/everinit-lab-**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: everinit-lab-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 0
+
+jobs:
+  build-rustc:
+    name: "stage1 ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+            default_sha: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
+          - variant: candidate
+            default_sha: "e7339de13da94243e4e0f0ee173be9be44164ab2"
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Resolve SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ matrix.variant }}" = "base" ]; then
+              echo "sha=${{ github.event.inputs.base_sha }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "sha=${{ github.event.inputs.candidate_sha }}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "sha=${{ matrix.default_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout rustc
+        uses: actions/checkout@v4
+        with:
+          repository: rust-lang/rust
+          ref: ${{ steps.sha.outputs.sha }}
+          path: rust
+          fetch-depth: 1
+
+      - name: Deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libssl-dev python3 git curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Configure + build stage1
+        working-directory: rust
+        run: |
+          cat > bootstrap.toml <<'TOML'
+          change-id = 99999999
+          profile = "compiler"
+          [llvm]
+          download-ci-llvm = true
+          [build]
+          docs = false
+          extended = false
+          tools = []
+          [rust]
+          channel = "dev"
+          download-rustc = false
+          debug = false
+          debuginfo-level = 0
+          debuginfo-level-rustc = 0
+          debuginfo-level-std = 0
+          incremental = false
+          dist-src = false
+          lld = false
+          llvm-tools = false
+          [dist]
+          src-tarball = false
+          TOML
+          python3 x.py build --stage 1 library -j"$(nproc)"
+          build/host/stage1/bin/rustc -vV
+
+      - name: Pack
+        run: tar -C rust/build/host -czf "stage1-${{ matrix.variant }}.tar.gz" stage1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ matrix.variant }}
+          path: stage1-${{ matrix.variant }}.tar.gz
+          retention-days: 5
+
+  # ------------------------------------------------------------------
+  # H1: same local, many init sites → expect large win (ratio << 1)
+  # H2: unique locals one init each → expect small/no win (falsify all-domain)
+  # H3: storage-dead reuse → expect medium win (same Local bit re-armed)
+  # H4: awaits → expect large win (superlinear cliff)
+  # H5: sequential loops → expect large win
+  # H6: nested loops same local → expect large win
+  # H7: diamond join (branch both arms init) → lattice height probe
+  # H8: multi-assign same block → join-less hot path
+  # H9: partial branch init → correctness-adjacent timing
+  # H10: hold/drop families from public repro suite
+  # ------------------------------------------------------------------
+  measure:
+    name: "${{ matrix.family }}/n=${{ matrix.n }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        family:
+          - same_local_loops
+          - unique_locals
+          - storage_dead_reuse
+          - awaits
+          - seq_loops
+          - nested_loops
+          - diamond_join
+          - multi_assign_block
+          - branch_partial
+          - chain_calls
+        n: [100, 200, 400, 800, 1600]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+
+      - name: Unpack + generate + A/B time
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          export BASE_RUSTC="$PWD/base/stage1/bin/rustc"
+          export CAND_RUSTC="$PWD/cand/stage1/bin/rustc"
+          $BASE_RUSTC -vV
+          $CAND_RUSTC -vV
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+
+          family = "${{ matrix.family }}"
+          n = int("${{ matrix.n }}")
+          base = os.environ["BASE_RUSTC"]
+          cand = os.environ["CAND_RUSTC"]
+
+          def gen(family: str, n: int) -> str:
+              if family == "same_local_loops":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64) -> u64 {"]
+                  for _ in range(n):
+                      lines += ["    loop {", "        acc = step(acc);", "        break;", "    }"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "unique_locals":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe() -> u64 {"]
+                  for i in range(n):
+                      lines += [f"    let mut x{i}: u64;",
+                                "    loop {",
+                                f"        x{i} = step({i} as u64);",
+                                "        break;",
+                                "    }"]
+                  lines += ["    " + " + ".join(f"x{i}" for i in range(n)), "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "storage_dead_reuse":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe() -> u64 {",
+                           "    let mut acc = 0u64;"]
+                  for _ in range(n):
+                      lines += ["    {",
+                                "        let mut y: u64;",
+                                "        loop { y = step(acc); break; }",
+                                "        acc = y;",
+                                "    }"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "awaits":
+                  # Same local, many .await sites (superlinear cliff repro)
+                  lines = ["#![allow(unused)]",
+                           "async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub async fn probe(t: &u64, mut acc: u64) -> u64 {"]
+                  for _ in range(n):
+                      lines.append("    acc = step(acc.wrapping_add(*t)).await;")
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "seq_loops":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64) -> u64 {"]
+                  for i in range(n):
+                      lines += [f"    while acc < {i} {{",
+                                "        acc = step(acc);",
+                                "        break;",
+                                "    }"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "nested_loops":
+                  # outer×inner ~ n, same local
+                  outer = max(1, int(n ** 0.5))
+                  inner = max(1, n // outer)
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64) -> u64 {"]
+                  for _ in range(outer):
+                      lines.append("    loop {")
+                      for _ in range(inner):
+                          lines += ["        loop {", "            acc = step(acc);", "            break;", "        }"]
+                      lines += ["        break;", "    }"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "diamond_join":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64, flag: bool) -> u64 {"]
+                  for i in range(n):
+                      lines += ["    if flag {",
+                                f"        acc = step(acc.wrapping_add({i}));",
+                                "    } else {",
+                                f"        acc = step(acc.wrapping_add({i + 1}));",
+                                "    }"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "multi_assign_block":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64) -> u64 {"]
+                  # many assigns, no loops (still many InitIndex in old lattice)
+                  for i in range(n):
+                      lines.append(f"    acc = step(acc.wrapping_add({i}));")
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "branch_partial":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(flag: bool) -> u64 {",
+                           "    let mut acc: u64;"]
+                  for i in range(n):
+                      lines += ["    if flag {",
+                                f"        acc = step({i});",
+                                "    } else {",
+                                f"        acc = step({i + 1});",
+                                "    }",
+                                "    let _ = acc;"]
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              if family == "chain_calls":
+                  lines = ["#![allow(unused)]",
+                           "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub fn probe(mut acc: u64) -> u64 {"]
+                  for i in range(n):
+                      lines.append(f"    acc = step(step(acc.wrapping_add({i})));")
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines) + "\n"
+
+              raise SystemExit(f"unknown family {family}")
+
+          src = Path("case.rs")
+          src.write_text(gen(family, n))
+
+          def time_compile(rustc: str, out: Path, warmup=1, runs=3):
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", str(src), "-o", str(out)]
+              for _ in range(warmup):
+                  r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                  if r.returncode != 0:
+                      raise RuntimeError(r.stderr.decode()[-3000:])
+              samples = []
+              for _ in range(runs):
+                  out.unlink(missing_ok=True)
+                  t0 = time.perf_counter()
+                  r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                  dt = time.perf_counter() - t0
+                  if r.returncode != 0:
+                      raise RuntimeError(r.stderr.decode()[-3000:])
+                  samples.append(dt)
+              return samples
+
+          # Cap extreme cases that may OOM/time out on free runners
+          if family in ("unique_locals",) and n >= 1600:
+              runs, warmup = 2, 1
+          else:
+              runs, warmup = 3, 1
+
+          try:
+              b = time_compile(base, Path("base.rmeta"), warmup=warmup, runs=runs)
+              c = time_compile(cand, Path("cand.rmeta"), warmup=warmup, runs=runs)
+          except Exception as e:
+              row = {"family": family, "n": n, "error": str(e)[:2000]}
+              Path("result.json").write_text(json.dumps(row, indent=2))
+              print(json.dumps(row))
+              open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(f"### FAIL {family} n={n}\n\n```\n{e}\n```\n")
+              raise
+
+          b_med, c_med = statistics.median(b), statistics.median(c)
+          ratio = c_med / b_med if b_med > 0 else None
+          row = {
+              "family": family,
+              "n": n,
+              "base_median_s": round(b_med, 4),
+              "cand_median_s": round(c_med, 4),
+              "ratio": round(ratio, 4) if ratio is not None else None,
+              "saving_s": round(b_med - c_med, 4),
+              "base_samples": [round(x, 4) for x in b],
+              "cand_samples": [round(x, 4) for x in c],
+              "hypothesis": {
+                  "same_local_loops": "H1 large win",
+                  "unique_locals": "H2 small/no win (falsify domain-width-only story)",
+                  "storage_dead_reuse": "H3 medium win",
+                  "awaits": "H4 large win superlinear",
+                  "seq_loops": "H5 large win",
+                  "nested_loops": "H6 large win",
+                  "diamond_join": "H7 join-heavy probe",
+                  "multi_assign_block": "H8 same-block multi InitIndex",
+                  "branch_partial": "H9 branch init",
+                  "chain_calls": "H10 call-dense assigns",
+              }.get(family, "?"),
+          }
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps(row))
+          md = (f"### {family} n={n}\n\n"
+                f"- hypothesis: {row['hypothesis']}\n"
+                f"- base median: **{b_med:.3f}s**\n"
+                f"- cand median: **{c_med:.3f}s**\n"
+                f"- ratio (cand/base): **{ratio:.3f}**\n"
+                f"- saving: **{b_med - c_med:.3f}s**\n")
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(md)
+
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lab-${{ matrix.family }}-${{ matrix.n }}
+          path: result.json
+          retention-days: 7
+
+  # Public repro suite from ashi009 (awaits/loops/hold/drop)
+  measure-repro-suite:
+    name: "repro ${{ matrix.src }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        src:
+          - awaits_400
+          - awaits_800
+          - awaits_1600
+          - loops_400
+          - loops_800
+          - loops_1600
+          - hold_500
+          - hold_1000
+          - hold_2000
+          - drop_500
+          - drop_1000
+          - drop_2000
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - uses: actions/checkout@v4
+        with:
+          repository: ashi009/rustc-async-borrowck-repros
+          path: repros
+          fetch-depth: 1
+
+      - name: Time single repro A/B
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+          stem = "${{ matrix.src }}"
+          src = Path("repros") / f"{stem}.rs"
+          if not src.exists():
+              # generate if missing
+              raise SystemExit(f"missing {src}")
+          base = "base/stage1/bin/rustc"
+          cand = "cand/stage1/bin/rustc"
+
+          def time_compile(rustc, out, runs=3):
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", str(src), "-o", str(out)]
+              subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              samples = []
+              for _ in range(runs):
+                  out.unlink(missing_ok=True)
+                  t0 = time.perf_counter()
+                  subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  samples.append(time.perf_counter() - t0)
+              return samples
+
+          b = time_compile(base, Path("b.rmeta"))
+          c = time_compile(cand, Path("c.rmeta"))
+          b_med, c_med = statistics.median(b), statistics.median(c)
+          ratio = c_med / b_med if b_med else None
+          row = {
+              "src": stem + ".rs",
+              "base_median_s": round(b_med, 4),
+              "cand_median_s": round(c_med, 4),
+              "ratio": round(ratio, 4) if ratio else None,
+              "saving_s": round(b_med - c_med, 4),
+              "base_samples": [round(x, 4) for x in b],
+              "cand_samples": [round(x, 4) for x in c],
+          }
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps(row))
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(
+              f"### repro {stem}\n\n"
+              f"- base **{b_med:.3f}s** cand **{c_med:.3f}s** ratio **{ratio:.3f}**\n"
+          )
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.src }}
+          path: result.json
+          retention-days: 7
+
+  # Fine-grained scaling for primary cliff (awaits + same_local)
+  scale-curve:
+    name: "scale ${{ matrix.family }}/n=${{ matrix.n }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [awaits, same_local_loops]
+        n: [50, 100, 150, 250, 350, 500, 650, 900, 1200, 2000]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-base
+          path: arts
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate
+          path: arts
+      - name: Scale point
+        run: |
+          mkdir -p base cand
+          tar -C base -xzf arts/stage1-base.tar.gz
+          tar -C cand -xzf arts/stage1-candidate.tar.gz
+          python3 <<'PY'
+          import json, os, statistics, subprocess, time
+          from pathlib import Path
+          family = "${{ matrix.family }}"
+          n = int("${{ matrix.n }}")
+
+          def gen(family, n):
+              if family == "awaits":
+                  lines = ["#![allow(unused)]",
+                           "async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                           "pub async fn probe(t: &u64, mut acc: u64) -> u64 {"]
+                  for _ in range(n):
+                      lines.append("    acc = step(acc.wrapping_add(*t)).await;")
+                  lines += ["    acc", "}"]
+                  return "\n".join(lines)+"\n"
+              lines = ["#![allow(unused)]",
+                       "fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                       "pub fn probe(mut acc: u64) -> u64 {"]
+              for _ in range(n):
+                  lines += ["    loop {", "        acc = step(acc);", "        break;", "    }"]
+              lines += ["    acc", "}"]
+              return "\n".join(lines)+"\n"
+
+          Path("case.rs").write_text(gen(family, n))
+
+          def time_one(rustc, runs=3):
+              out = Path("o.rmeta")
+              cmd = [rustc, "--edition", "2021", "--crate-type=lib",
+                     "--emit=metadata", "case.rs", "-o", str(out)]
+              subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              s = []
+              for _ in range(runs):
+                  out.unlink(missing_ok=True)
+                  t0 = time.perf_counter()
+                  subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  s.append(time.perf_counter()-t0)
+              return s
+
+          b = time_one("base/stage1/bin/rustc")
+          c = time_one("cand/stage1/bin/rustc")
+          b_med, c_med = statistics.median(b), statistics.median(c)
+          row = {
+              "kind": "scale",
+              "family": family,
+              "n": n,
+              "base_median_s": round(b_med, 4),
+              "cand_median_s": round(c_med, 4),
+              "ratio": round(c_med/b_med, 4) if b_med else None,
+              "saving_s": round(b_med-c_med, 4),
+          }
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          print(json.dumps(row))
+          open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(
+              f"### scale {family} n={n}\n\nbase {b_med:.3f}s cand {c_med:.3f}s ratio {c_med/b_med:.3f}\n"
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scale-${{ matrix.family }}-${{ matrix.n }}
+          path: result.json
+          retention-days: 7
+
+  # Optional -Ztime-passes on a mid-size await case
+  time-passes:
+    name: "time-passes ${{ matrix.variant }}"
+    needs: build-rustc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, candidate]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-${{ matrix.variant }}
+          path: arts
+      - name: Generate await-800 + time-passes
+        run: |
+          tar -xzf arts/stage1-${{ matrix.variant }}.tar.gz
+          RUSTC="$PWD/stage1/bin/rustc"
+          python3 - <<'PY'
+          from pathlib import Path
+          n=800
+          lines=["#![allow(unused)]","async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                 "pub async fn probe(t: &u64, mut acc: u64) -> u64 {"]
+          for _ in range(n):
+              lines.append("    acc = step(acc.wrapping_add(*t)).await;")
+          lines += ["    acc","}"]
+          Path("awaits_800.rs").write_text("\n".join(lines)+"\n")
+          PY
+          set +e
+          $RUSTC --edition 2021 --crate-type=lib --emit=metadata awaits_800.rs -o a.rmeta \
+            -Ztime-passes 2> time-passes.txt
+          ec=$?
+          set -e
+          head -200 time-passes.txt || true
+          # Also try -Zself-profile if available
+          $RUSTC -Zhelp 2>&1 | rg -n "time-passes|self-profile|borrowck" || true
+          ls -la
+          # Always upload whatever we got
+          echo "exit=$ec" >> time-passes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: time-passes-${{ matrix.variant }}
+          path: time-passes.txt
+          retention-days: 7
+
+  # Aggregate all JSON results into one report
+  report:
+    name: Aggregate report
+    needs: [measure, measure-repro-suite, scale-curve, time-passes]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: '*'
+          merge-multiple: false
+
+      - name: Build summary table
+        run: |
+          python3 <<'PY'
+          import json, os
+          from pathlib import Path
+
+          rows = []
+          for p in Path("all").rglob("result.json"):
+              try:
+                  rows.append(json.loads(p.read_text()))
+              except Exception as e:
+                  print("skip", p, e)
+
+          def sort_key(r):
+              return (r.get("family") or r.get("src") or r.get("kind") or "", r.get("n") or 0)
+
+          rows.sort(key=sort_key)
+          Path("everinit-lab-all.json").write_text(json.dumps(rows, indent=2))
+
+          md = ["# EverInit lab aggregate", "",
+                f"Total result files: **{len(rows)}**", "",
+                "| family/src | n | base (s) | cand (s) | ratio | saving (s) | note |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+          strong = []
+          for r in rows:
+              if "error" in r:
+                  md.append(f"| {r.get('family', r.get('src','?'))} | {r.get('n','')} | ERR | ERR | — | — | {r['error'][:40]} |")
+                  continue
+              fam = r.get("family") or r.get("src") or r.get("kind")
+              n = r.get("n", "")
+              b = r.get("base_median_s")
+              c = r.get("cand_median_s")
+              ratio = r.get("ratio")
+              sav = r.get("saving_s")
+              note = r.get("hypothesis", "")
+              md.append(f"| {fam} | {n} | {b} | {c} | {ratio} | {sav} | {note} |")
+              if fam in ("awaits", "same_local_loops", "seq_loops") and isinstance(n, int) and n >= 800 and ratio is not None:
+                  strong.append(ratio < 0.5)
+
+          md += ["",
+                 f"Primary large-case 2× wins count: **{sum(1 for x in strong if x)}/{len(strong)}**",
+                 "",
+                 "## Interpretation guide",
+                 "",
+                 "- **H1/H4/H5 (same local / awaits / loops):** ratio ≪ 1 supports #160033 lattice collapse",
+                 "- **H2 (unique_locals):** ratio ~1 means win is *duplicate InitIndex*, not dense-domain width",
+                 "- **Scale curve:** base superlinear + cand near-linear is the smoking gun",
+                 ""]
+          text = "\n".join(md)
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(text + "\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: everinit-lab-aggregate
+          path: everinit-lab-all.json
+          retention-days: 14

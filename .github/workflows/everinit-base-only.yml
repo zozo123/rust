@@ -9,6 +9,7 @@ on:
         default: "09ee43b2d6055539771bee8ac30a6e56eb4db773"
   push:
     branches:
+      - validation/everinit-ci
       - validation/everinit-base-**
 
 permissions:
@@ -62,6 +63,21 @@ jobs:
           repository: ashi009/rustc-async-borrowck-repros
           path: repros
 
+      - name: Generate extra scaling sources
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          def awaits(n):
+              L=["#![allow(unused)]","async fn step(x: u64) -> u64 { x.wrapping_add(1) }",
+                 "pub async fn probe(t: &u64, mut acc: u64) -> u64 {"]
+              for _ in range(n):
+                  L.append("    acc = step(acc.wrapping_add(*t)).await;")
+              Path(f"repros/gen_awaits_{n}.rs").write_text("\n".join(L+["    acc","}"])+"\n")
+          for n in (100,200,300,500,700,900,1100,1300,1500):
+              awaits(n)
+          print("generated")
+          PY
+
       - name: Time MCVEs
         run: |
           RUSTC="$PWD/rust/build/host/stage1/bin/rustc"
@@ -75,7 +91,11 @@ jobs:
               samples=[]
               out=Path("t.rmeta")
               cmd=[rustc,"--edition","2021","--crate-type=lib","--emit=metadata",str(src),"-o",str(out)]
-              subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              try:
+                  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              except Exception as e:
+                  rows.append({"src":src.name,"error":str(e)})
+                  continue
               for _ in range(3):
                   out.unlink(missing_ok=True)
                   t0=time.perf_counter()
@@ -87,7 +107,10 @@ jobs:
           Path("base-results.json").write_text(json.dumps(rows,indent=2))
           md=["### Base-only MCVE sweep",""]
           for r in rows:
-              md.append(f"- `{r['src']}`: {r['median_s']:.3f}s")
+              if "error" in r:
+                  md.append(f"- `{r['src']}`: ERR")
+              else:
+                  md.append(f"- `{r['src']}`: {r['median_s']:.3f}s")
           open(__import__("os").environ["GITHUB_STEP_SUMMARY"],"a").write("\n".join(md)+"\n")
           PY
 
