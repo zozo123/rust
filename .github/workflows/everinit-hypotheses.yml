@@ -1,0 +1,161 @@
+# Parallel hypothesis probes on #160033 candidate only (faster iteration after A/B baseline)
+name: EverInit hypotheses (candidate matrix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "rustc SHA to build"
+        required: true
+        default: "e7339de13da94243e4e0f0ee173be9be44164ab2"
+  push:
+    branches:
+      - validation/everinit-hyp-**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build stage1 candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: rust-lang/rust
+          ref: ${{ github.event.inputs.candidate_sha || 'e7339de13da94243e4e0f0ee173be9be44164ab2' }}
+          path: rust
+          fetch-depth: 1
+
+      - name: Toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config libssl-dev python3 git curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: bootstrap.toml
+        working-directory: rust
+        run: |
+          cat > bootstrap.toml <<'TOML'
+          change-id = 99999999
+          profile = "compiler"
+          [llvm]
+          download-ci-llvm = true
+          [build]
+          docs = false
+          extended = false
+          tools = []
+          [rust]
+          channel = "dev"
+          debug = false
+          debuginfo-level = 0
+          debuginfo-level-rustc = 0
+          debuginfo-level-std = 0
+          incremental = false
+          dist-src = false
+          TOML
+
+      - name: Build stage1
+        working-directory: rust
+        run: python3 x.py build --stage 1 library -j"$(nproc)"
+
+      - name: Pack
+        run: tar -C rust/build/host -czf stage1-candidate.tar.gz stage1
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-candidate-hyp
+          path: stage1-candidate.tar.gz
+          retention-days: 3
+
+  measure:
+    name: "Hyp ${{ matrix.family }}/${{ matrix.n }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [same_local_loops, unique_locals, storage_dead_reuse]
+        n: [100, 200, 400, 800, 1200]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage1-candidate-hyp
+          path: arts
+
+      - name: Unpack + generate + time
+        run: |
+          tar -xzf arts/stage1-candidate.tar.gz
+          RUSTC="$PWD/stage1/bin/rustc"
+          $RUSTC -vV
+          python3 <<PY
+          from pathlib import Path
+          import subprocess, time, statistics, json, os
+
+          family = "${{ matrix.family }}"
+          n = int("${{ matrix.n }}")
+          rustc = os.environ.get("RUSTC", "stage1/bin/rustc")
+
+          def gen_same_local_loops(n):
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe(mut acc: u64) -> u64 {"]
+              for _ in range(n):
+                  lines += ["    loop {", "        acc = step(acc);", "        break;", "    }"]
+              lines += ["    acc", "}"]
+              return "\n".join(lines)+"\n"
+
+          def gen_unique_locals(n):
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe() -> u64 {"]
+              for i in range(n):
+                  lines += [f"    let mut x{i}: u64;", "    loop {", f"        x{i} = step({i});", "        break;", "    }"]
+              lines += ["    " + " + ".join(f"x{i}" for i in range(n)), "}"]
+              return "\n".join(lines)+"\n"
+
+          def gen_storage_dead_reuse(n):
+              lines = ["#![allow(unused)]", "fn step(x: u64) -> u64 { x.wrapping_add(1) }", "pub fn probe() -> u64 {", "    let mut acc = 0u64;"]
+              for _ in range(n):
+                  lines += ["    {", "        let mut y: u64;", "        loop { y = step(acc); break; }", "        acc = y;", "    }"]
+              lines += ["    acc", "}"]
+              return "\n".join(lines)+"\n"
+
+          gens = {
+              "same_local_loops": gen_same_local_loops,
+              "unique_locals": gen_unique_locals,
+              "storage_dead_reuse": gen_storage_dead_reuse,
+          }
+          src = Path("case.rs")
+          src.write_text(gens[family](n))
+          out = Path("case.rmeta")
+          cmd = [rustc, "--edition", "2021", "--crate-type=lib", "--emit=metadata", str(src), "-o", str(out)]
+          # warmup
+          subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+          samples=[]
+          for _ in range(5):
+              out.unlink(missing_ok=True)
+              t0=time.perf_counter()
+              r=subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              dt=time.perf_counter()-t0
+              if r.returncode != 0:
+                  print(r.stderr.decode()[-2000:])
+                  raise SystemExit(f"compile failed family={family} n={n}")
+              samples.append(dt)
+          med=statistics.median(samples)
+          row={"family":family,"n":n,"median_s":round(med,4),"samples":[round(s,4) for s in samples]}
+          print(json.dumps(row))
+          Path("result.json").write_text(json.dumps(row, indent=2))
+          summary=f"### {family} n={n}\n\n- median: **{med:.3f}s**\n- samples: {samples}\n"
+          print(summary)
+          open(os.environ["GITHUB_STEP_SUMMARY"],"a").write(summary)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyp-${{ matrix.family }}-${{ matrix.n }}
+          path: result.json
